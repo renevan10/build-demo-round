@@ -213,6 +213,35 @@ def create_meeting_idempotent(
     )
 
 
+def submit_feedback(
+    conn: sqlite3.Connection,
+    meeting_id: int,
+    employee_id: int,
+    usefulness_score: int,
+    submitted_at_utc: str,
+) -> None:
+    """Upsert: resubmitting the same (meeting, employee) pair updates the
+    existing rating instead of erroring or duplicate-inserting -- SQLite's
+    `ON CONFLICT DO UPDATE` does this as one atomic statement, not a
+    check-then-insert with a gap in the middle.
+
+    The composite FK on meeting_feedback -> meeting_participants (see
+    migrations/0001_init.sql) is what actually enforces "only an invited
+    employee can rate this meeting" -- a sqlite3.IntegrityError from this
+    call means exactly that; this function doesn't check it itself.
+    Whether the meeting has actually happened yet is a caller concern
+    (app/main.py checks end_utc against the current time), not something
+    the schema can express.
+    """
+    conn.execute(
+        "INSERT INTO meeting_feedback (meeting_id, employee_id, usefulness_score, submitted_at_utc) "
+        "VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(meeting_id, employee_id) DO UPDATE SET "
+        "usefulness_score = excluded.usefulness_score, submitted_at_utc = excluded.submitted_at_utc",
+        (meeting_id, employee_id, usefulness_score, submitted_at_utc),
+    )
+
+
 def list_employee_schedule(
     conn: sqlite3.Connection, employee_id: int, limit: int, offset: int = 0
 ) -> list[Meeting]:
@@ -249,6 +278,11 @@ class MeetingSummary:
     priority: str
     status: str
     participant_names: list[str]
+    # Only populated by list_employee_schedule_with_details, where there's
+    # a single natural "viewpoint" employee. list_meetings_with_details
+    # spans everyone, so there's no one person's rating to show -- always
+    # None there, not a bug.
+    my_usefulness_score: int | None = None
 
 
 def _row_to_summary(row: sqlite3.Row) -> MeetingSummary:
@@ -265,10 +299,11 @@ def _row_to_summary(row: sqlite3.Row) -> MeetingSummary:
         priority=row["priority"],
         status=row["status"],
         participant_names=raw_names.split("||") if raw_names else [],
+        my_usefulness_score=row["my_usefulness_score"],
     )
 
 
-def _detail_query(page_filter: str) -> str:
+def _detail_query(page_filter: str, include_viewer_feedback: bool = False) -> str:
     # Paginate meeting ids FIRST, in a `page` CTE with its own LIMIT/OFFSET
     # over the bare `meetings` table (cheap, index-backed on start_utc) --
     # THEN join for organizer/room/participant names, only for that page's
@@ -285,18 +320,34 @@ def _detail_query(page_filter: str) -> str:
     # getting slower unnoticed. CROSS JOIN disables SQLite's freedom to
     # reorder *that specific join*, forcing it to drive from the small
     # `page` result and do a primary-key lookup into `meetings` per row.
+    #
+    # include_viewer_feedback adds a LEFT JOIN against meeting_feedback
+    # pinned to one viewer employee_id (bound as the LAST `?` in this
+    # query, after the CTE's own params) -- selecting a non-aggregated
+    # column (mf.usefulness_score) alongside GROUP BY m.id is safe here
+    # specifically because that join is constrained to at most one row per
+    # meeting (the composite PK is (meeting_id, employee_id), and
+    # employee_id is fixed), so it's functionally singular per group, not
+    # an arbitrary pick.
+    viewer_feedback_select = "mf.usefulness_score" if include_viewer_feedback else "NULL"
+    viewer_feedback_join = (
+        "LEFT JOIN meeting_feedback mf ON mf.meeting_id = m.id AND mf.employee_id = ? "
+        if include_viewer_feedback
+        else ""
+    )
     return (
         "WITH page AS ("
         f"    SELECT id FROM meetings {page_filter} ORDER BY start_utc LIMIT ? OFFSET ?"
         ") "
         "SELECT m.id, m.title, m.organizer_id, o.name AS organizer_name, "
         "       m.start_utc, m.end_utc, m.room_id, r.name AS room_name, "
-        "       m.priority, m.status, "
+        f"       m.priority, m.status, {viewer_feedback_select} AS my_usefulness_score, "
         "       GROUP_CONCAT(p.name, '||') AS participant_names "
         "FROM page "
         "CROSS JOIN meetings m ON m.id = page.id "
         "JOIN employees o ON o.id = m.organizer_id "
         "LEFT JOIN meeting_rooms r ON r.id = m.room_id "
+        f"{viewer_feedback_join}"
         "LEFT JOIN meeting_participants mp ON mp.meeting_id = m.id "
         "LEFT JOIN employees p ON p.id = mp.employee_id "
         "GROUP BY m.id "
@@ -317,7 +368,12 @@ def list_employee_schedule_with_details(
     conn: sqlite3.Connection, employee_id: int, limit: int, offset: int = 0
 ) -> list[MeetingSummary]:
     """Same shape as list_meetings_with_details, filtered to one employee's
-    schedule (as an organizer or an invited participant)."""
+    schedule (as an organizer or an invited participant), with that same
+    employee's own usefulness rating for each meeting -- the one place a
+    single "viewpoint" employee naturally exists."""
     page_filter = "WHERE id IN (SELECT meeting_id FROM meeting_participants WHERE employee_id = ?)"
-    rows = conn.execute(_detail_query(page_filter), (employee_id, limit, offset)).fetchall()
+    rows = conn.execute(
+        _detail_query(page_filter, include_viewer_feedback=True),
+        (employee_id, limit, offset, employee_id),
+    ).fetchall()
     return [_row_to_summary(row) for row in rows]

@@ -30,6 +30,7 @@ from app.repository_meetings import (
     create_meeting_idempotent,
     list_employee_schedule_with_details,
     list_meetings_with_details,
+    submit_feedback,
 )
 from app.dashboard import EmployeeMeetingTime, summarize_meeting_time
 from app.repository_dashboard import get_attendances_in_utc_window
@@ -345,6 +346,46 @@ def get_employee_schedule(
 ) -> list[MeetingSummary]:
     with db() as conn:
         return list_employee_schedule_with_details(conn, employee_id, limit=limit, offset=offset)
+
+
+class SubmitFeedbackRequest(BaseModel):
+    employee_id: int
+    usefulness_score: int = Field(..., ge=1, le=5)
+
+
+@app.post("/api/meetings/{meeting_id}/feedback", status_code=204, response_model=None)
+def post_meeting_feedback(meeting_id: int, body: SubmitFeedbackRequest) -> None:
+    with db() as conn:
+        meeting_row = conn.execute(
+            "SELECT end_utc, status FROM meetings WHERE id = ?", (meeting_id,)
+        ).fetchone()
+        if meeting_row is None:
+            raise HTTPException(status_code=404, detail="meeting not found")
+        if meeting_row["status"] == "cancelled":
+            raise HTTPException(status_code=400, detail="can't rate a cancelled meeting")
+        # Nothing in this app ever transitions a meeting's status to
+        # 'completed' -- there's no cron/background job for it. Gating on
+        # the actual end time having passed is correct without needing
+        # that infrastructure, and more honest than gating on a status
+        # value nothing sets.
+        if meeting_row["end_utc"] > to_utc_z(utc_now()):
+            raise HTTPException(status_code=400, detail="can't rate a meeting that hasn't happened yet")
+
+        try:
+            submit_feedback(
+                conn,
+                meeting_id,
+                body.employee_id,
+                body.usefulness_score,
+                to_utc_z(utc_now()),
+            )
+        except sqlite3.IntegrityError as exc:
+            # The composite FK on meeting_feedback -> meeting_participants
+            # is what's actually enforcing this: only an invited employee
+            # can rate the meeting.
+            raise HTTPException(
+                status_code=400, detail="only an invited employee can rate this meeting"
+            ) from exc
 
 
 # ---- Dashboard ----

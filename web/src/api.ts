@@ -43,6 +43,10 @@ export type MeetingSummary = {
   priority: Priority;
   status: MeetingStatus;
   participant_names: string[];
+  // Only populated by getEmployeeSchedule -- the one place a single
+  // "viewpoint" employee naturally exists to rate as. Always null from
+  // getMeetings, which spans everyone.
+  my_usefulness_score: number | null;
 };
 
 export type CreateMeetingInput = {
@@ -194,4 +198,21 @@ export function suggestMeetingSlots(input: SuggestSlotsInput): Promise<RankedSlo
 
 export function bookSlot(input: BookSlotInput): Promise<Meeting> {
   return postJson<Meeting>("/api/meetings/book-slot", input);
+}
+
+export async function submitMeetingFeedback(
+  meetingId: number,
+  employeeId: number,
+  usefulnessScore: number,
+): Promise<void> {
+  const res = await fetch(`/api/meetings/${meetingId}/feedback`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ employee_id: employeeId, usefulness_score: usefulnessScore }),
+  });
+  if (!res.ok) {
+    // 204 No Content on success -- postJson's unconditional res.json() would
+    // throw on the empty body, hence a dedicated helper here.
+    throw new ApiError(res.status, await extractDetail(res));
+  }
 }

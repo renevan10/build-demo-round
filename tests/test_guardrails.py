@@ -19,6 +19,7 @@ from app.repository_meetings import (
     _detail_query,
     create_meeting_idempotent,
     list_employee_schedule,
+    submit_feedback,
 )
 from app.timeutil import local_wall_clock_to_utc, to_user_local, to_utc_z, user_local_date_str
 from fixtures.seed_data import seed
@@ -349,6 +350,47 @@ def test_feedback_from_a_non_participant_is_rejected_at_the_db_level(conn, base)
         )
 
 
+def test_submit_feedback_upserts_instead_of_erroring_on_resubmission(conn, base):
+    meeting = create_meeting_idempotent(
+        conn,
+        idempotency_key="feedback-upsert-check",
+        title="Rated meeting",
+        organizer_id=base["alice"],
+        start_utc="2026-01-09T10:00:00Z",
+        end_utc="2026-01-09T10:30:00Z",
+        created_at_utc="2026-01-01T00:00:00Z",
+        participant_ids=[base["bob"]],
+    )
+
+    submit_feedback(conn, meeting.id, base["bob"], 2, "2026-01-09T11:00:00Z")
+    submit_feedback(conn, meeting.id, base["bob"], 5, "2026-01-09T11:05:00Z")
+
+    rows = conn.execute(
+        "SELECT usefulness_score, submitted_at_utc FROM meeting_feedback "
+        "WHERE meeting_id = ? AND employee_id = ?",
+        (meeting.id, base["bob"]),
+    ).fetchall()
+    assert len(rows) == 1, "resubmitting must update the row, not insert a second one"
+    assert rows[0]["usefulness_score"] == 5
+    assert rows[0]["submitted_at_utc"] == "2026-01-09T11:05:00Z"
+
+
+def test_submit_feedback_from_a_non_participant_is_rejected(conn, base):
+    meeting = create_meeting_idempotent(
+        conn,
+        idempotency_key="feedback-non-participant-check",
+        title="Alice-only sync",
+        organizer_id=base["alice"],
+        start_utc="2026-01-10T10:00:00Z",
+        end_utc="2026-01-10T10:30:00Z",
+        created_at_utc="2026-01-01T00:00:00Z",
+        participant_ids=[],  # bob is never invited
+    )
+
+    with pytest.raises(sqlite3.IntegrityError):
+        submit_feedback(conn, meeting.id, base["bob"], 4, "2026-01-10T11:00:00Z")
+
+
 def test_employee_schedule_pagination_returns_correct_slice_without_full_scan(conn, base):
     for i in range(25):
         create_meeting_idempotent(
@@ -407,6 +449,23 @@ def test_meetings_detail_query_paginates_before_the_join_not_after(conn):
         "the outer join must not do a full SCAN of `meetings` (m) -- "
         f"it must drive from the small `page` CTE instead. Full plan: {ops}"
     )
+    assert any(op == "SCAN page" for op in ops), f"expected the outer query to drive from `page`. Full plan: {ops}"
+
+
+def test_meetings_detail_query_with_viewer_feedback_also_avoids_a_full_scan(conn):
+    """Same regression guard as above, for the include_viewer_feedback=True
+    variant (adds a LEFT JOIN meeting_feedback) -- an extra join is exactly
+    the kind of change that could quietly nudge SQLite's planner back
+    toward driving from `m` again."""
+    page_filter = "WHERE id IN (SELECT meeting_id FROM meeting_participants WHERE employee_id = ?)"
+    plan = conn.execute(
+        "EXPLAIN QUERY PLAN " + _detail_query(page_filter, include_viewer_feedback=True),
+        (1, 10, 0, 1),
+    ).fetchall()
+    ops = [row["detail"] for row in plan]
+
+    full_table_scans = {op.split()[1] for op in ops if op.startswith("SCAN")}
+    assert "m" not in full_table_scans, f"outer join must not do a full SCAN of `meetings` (m). Full plan: {ops}"
     assert any(op == "SCAN page" for op in ops), f"expected the outer query to drive from `page`. Full plan: {ops}"
 
 

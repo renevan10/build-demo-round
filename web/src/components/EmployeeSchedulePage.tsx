@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { getEmployeeSchedule, type Employee, type MeetingSummary } from "../api";
+import { getEmployeeSchedule, submitMeetingFeedback, type Employee, type MeetingSummary } from "../api";
 import MeetingTable from "./MeetingTable";
 import Pager from "./Pager";
 
@@ -38,6 +38,12 @@ export default function EmployeeSchedulePage({
     load();
   }, [load, refreshSignal]);
 
+  async function handleRate(meetingId: number, score: number) {
+    if (employeeId === null) return;
+    await submitMeetingFeedback(meetingId, employeeId, score);
+    load(); // refetch so the new my_usefulness_score flows back down
+  }
+
   return (
     <section>
       <h2 style={{ marginTop: 0 }}>Employee schedule</h2>
@@ -59,7 +65,15 @@ export default function EmployeeSchedulePage({
       </label>
       <div style={{ marginTop: "1rem" }}>
         {error && <p style={{ color: "var(--danger)" }}>{error}</p>}
-        {loading ? <p>Loading…</p> : <MeetingTable meetings={meetings} />}
+        {loading ? (
+          <p>Loading…</p>
+        ) : (
+          <MeetingTable
+            meetings={meetings}
+            viewerEmployeeId={employeeId ?? undefined}
+            onRate={handleRate}
+          />
+        )}
         <Pager
           offset={offset}
           limit={LIMIT}
