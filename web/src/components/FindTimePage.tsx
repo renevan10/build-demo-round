@@ -144,7 +144,12 @@ export default function FindTimePage({
       const meeting = await bookSlot({
         title: title.trim(),
         organizer_id: organizerId,
-        participant_ids: [...requiredIds, ...optionalIds],
+        // Required vs. optional must stay distinct through booking, not
+        // just search: the DB layer only hard-blocks on a required
+        // attendee's conflict, matching the suggester's own rule that an
+        // optional attendee never blocks a slot.
+        participant_ids: Array.from(requiredIds),
+        optional_participant_ids: Array.from(optionalIds),
         room_id: roomId === "" ? null : roomId,
         priority,
         start_utc: slot.start_utc,

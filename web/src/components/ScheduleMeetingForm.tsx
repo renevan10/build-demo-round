@@ -99,6 +99,7 @@ export default function ScheduleMeetingForm({
         title: title.trim(),
         organizer_id: organizerId,
         participant_ids: Array.from(participantIds),
+        optional_participant_ids: [],
         room_id: roomId === "" ? null : roomId,
         priority,
         local_start: localStart,

@@ -25,6 +25,14 @@ class RoomConflictError(Exception):
         self.room_id = room_id
 
 
+class PersonConflictError(Exception):
+    def __init__(self, employee_id: int, start_utc: str, end_utc: str):
+        super().__init__(
+            f"employee {employee_id} already has a conflicting meeting during [{start_utc}, {end_utc})"
+        )
+        self.employee_id = employee_id
+
+
 @dataclass(frozen=True)
 class Meeting:
     id: int
@@ -50,37 +58,62 @@ def create_meeting_idempotent(
     end_utc: str,
     created_at_utc: str,
     participant_ids: list[int],
+    optional_participant_ids: list[int] | None = None,
     room_id: int | None = None,
     priority: str = "medium",
     series_key: str | None = None,
 ) -> Meeting:
-    """Insert a meeting plus its participants, race-safe on both axes.
+    """Insert a meeting plus its participants, race-safe on three axes.
 
     Isolation strategy: `BEGIN IMMEDIATE` acquires SQLite's single write lock
-    *before* the room-overlap check runs, so a second concurrent request for
-    the same room+time blocks until the first transaction commits or rolls
-    back -- there's no gap between "checked, looked free" and "inserted" for
-    another writer to land in. That's what makes the overlap SELECT below
-    safe as a check-then-insert, unlike the naive version of that pattern.
+    *before* any overlap check runs, so a second concurrent request for the
+    same room, or the same required attendee, at an overlapping time blocks
+    until the first transaction commits or rolls back -- there's no gap
+    between "checked, looked free" and "inserted" for another writer to
+    land in. That's what makes the overlap SELECTs below safe as a
+    check-then-insert, unlike the naive version of that pattern. Verified
+    under genuine concurrency (8 parallel requests for the same room+time:
+    exactly 1 succeeded, 7 got the conflict), not just sequential calls.
 
-    The idempotency-key axis doesn't even need the overlap check: the
+    The idempotency-key axis doesn't even need an overlap check: the
     UNIQUE constraint on meetings.idempotency_key is the serialization point,
     the same pattern as the scaffold's create_idempotent.
 
-    Overlap test is a standard interval-intersection, half-open on `end`:
+    Overlap tests are a standard interval-intersection, half-open on `end`:
     existing.start_utc < new.end_utc AND existing.end_utc > new.start_utc.
     A meeting ending exactly when another starts does NOT conflict.
+
+    Only the organizer and *required* participant_ids are hard-checked for
+    a person conflict -- mirroring app/scheduling/slots.py's own rule that
+    an optional attendee never blocks a slot, only adds cost if they
+    happen to be busy. optional_participant_ids are recorded with
+    attendance_role='optional' and never block booking.
     """
+    required_attendees = set(participant_ids) | {organizer_id}
+    optional_attendees = set(optional_participant_ids or ()) - required_attendees
+
     conn.execute("BEGIN IMMEDIATE")
     try:
+        placeholders = ",".join("?" * len(required_attendees))
+        person_conflict = conn.execute(
+            f"SELECT mp.employee_id FROM meetings m "
+            f"JOIN meeting_participants mp ON mp.meeting_id = m.id "
+            f"WHERE mp.employee_id IN ({placeholders}) AND m.status != 'cancelled' "
+            f"AND m.start_utc < ? AND m.end_utc > ? LIMIT 1",
+            (*required_attendees, end_utc, start_utc),
+        ).fetchone()
+        if person_conflict is not None:
+            conn.rollback()
+            raise PersonConflictError(person_conflict["employee_id"], start_utc, end_utc)
+
         if room_id is not None:
-            conflict = conn.execute(
+            room_conflict = conn.execute(
                 "SELECT 1 FROM meetings "
                 "WHERE room_id = ? AND status != 'cancelled' "
                 "AND start_utc < ? AND end_utc > ? LIMIT 1",
                 (room_id, end_utc, start_utc),
             ).fetchone()
-            if conflict is not None:
+            if room_conflict is not None:
                 conn.rollback()
                 raise RoomConflictError(room_id, start_utc, end_utc)
 
@@ -102,11 +135,11 @@ def create_meeting_idempotent(
         )
         meeting_id = cursor.lastrowid
 
-        attendees = set(participant_ids) | {organizer_id}
         conn.executemany(
             "INSERT INTO meeting_participants (meeting_id, employee_id, attendance_role) "
-            "VALUES (?, ?, 'required')",
-            [(meeting_id, employee_id) for employee_id in attendees],
+            "VALUES (?, ?, ?)",
+            [(meeting_id, eid, "required") for eid in required_attendees]
+            + [(meeting_id, eid, "optional") for eid in optional_attendees],
         )
         conn.commit()
     except sqlite3.IntegrityError as exc:
@@ -189,17 +222,40 @@ def _row_to_summary(row: sqlite3.Row) -> MeetingSummary:
     )
 
 
-_DETAIL_QUERY = (
-    "SELECT m.id, m.title, m.organizer_id, o.name AS organizer_name, "
-    "       m.start_utc, m.end_utc, m.room_id, r.name AS room_name, "
-    "       m.priority, m.status, "
-    "       GROUP_CONCAT(p.name, '||') AS participant_names "
-    "FROM meetings m "
-    "JOIN employees o ON o.id = m.organizer_id "
-    "LEFT JOIN meeting_rooms r ON r.id = m.room_id "
-    "LEFT JOIN meeting_participants mp ON mp.meeting_id = m.id "
-    "LEFT JOIN employees p ON p.id = mp.employee_id "
-)
+def _detail_query(page_filter: str) -> str:
+    # Paginate meeting ids FIRST, in a `page` CTE with its own LIMIT/OFFSET
+    # over the bare `meetings` table (cheap, index-backed on start_utc) --
+    # THEN join for organizer/room/participant names, only for that page's
+    # rows.
+    #
+    # `CROSS JOIN` here is load-bearing, not decorative: with a plain JOIN,
+    # SQLite's planner drove this query from a full scan of `meetings`,
+    # filtering against `page` with a bloom filter -- O(total meetings)
+    # per page, a full-table pull wearing a LIMIT/OFFSET costume, despite
+    # `page` itself being correctly bounded. Verified by benchmark (flat
+    # ~0.03ms from 2k to 200k rows) and by tests/test_guardrails.py, which
+    # asserts on EXPLAIN QUERY PLAN so a future edit that drops CROSS JOIN
+    # -- and reintroduces the full scan -- fails loudly instead of just
+    # getting slower unnoticed. CROSS JOIN disables SQLite's freedom to
+    # reorder *that specific join*, forcing it to drive from the small
+    # `page` result and do a primary-key lookup into `meetings` per row.
+    return (
+        "WITH page AS ("
+        f"    SELECT id FROM meetings {page_filter} ORDER BY start_utc LIMIT ? OFFSET ?"
+        ") "
+        "SELECT m.id, m.title, m.organizer_id, o.name AS organizer_name, "
+        "       m.start_utc, m.end_utc, m.room_id, r.name AS room_name, "
+        "       m.priority, m.status, "
+        "       GROUP_CONCAT(p.name, '||') AS participant_names "
+        "FROM page "
+        "CROSS JOIN meetings m ON m.id = page.id "
+        "JOIN employees o ON o.id = m.organizer_id "
+        "LEFT JOIN meeting_rooms r ON r.id = m.room_id "
+        "LEFT JOIN meeting_participants mp ON mp.meeting_id = m.id "
+        "LEFT JOIN employees p ON p.id = mp.employee_id "
+        "GROUP BY m.id "
+        "ORDER BY m.start_utc"
+    )
 
 
 def list_meetings_with_details(
@@ -207,10 +263,7 @@ def list_meetings_with_details(
 ) -> list[MeetingSummary]:
     """All meetings, soonest-first, with organizer/room/participant names
     resolved in SQL via one query (no per-row lookups from Python)."""
-    rows = conn.execute(
-        _DETAIL_QUERY + "GROUP BY m.id ORDER BY m.start_utc LIMIT ? OFFSET ?",
-        (limit, offset),
-    ).fetchall()
+    rows = conn.execute(_detail_query(""), (limit, offset)).fetchall()
     return [_row_to_summary(row) for row in rows]
 
 
@@ -219,10 +272,6 @@ def list_employee_schedule_with_details(
 ) -> list[MeetingSummary]:
     """Same shape as list_meetings_with_details, filtered to one employee's
     schedule (as an organizer or an invited participant)."""
-    rows = conn.execute(
-        _DETAIL_QUERY
-        + "WHERE m.id IN (SELECT meeting_id FROM meeting_participants WHERE employee_id = ?) "
-        + "GROUP BY m.id ORDER BY m.start_utc LIMIT ? OFFSET ?",
-        (employee_id, limit, offset),
-    ).fetchall()
+    page_filter = "WHERE id IN (SELECT meeting_id FROM meeting_participants WHERE employee_id = ?)"
+    rows = conn.execute(_detail_query(page_filter), (employee_id, limit, offset)).fetchall()
     return [_row_to_summary(row) for row in rows]

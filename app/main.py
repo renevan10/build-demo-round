@@ -24,6 +24,7 @@ from app.repository_meetings import (
     DuplicateMeetingError,
     Meeting,
     MeetingSummary,
+    PersonConflictError,
     RoomConflictError,
     create_meeting_idempotent,
     list_employee_schedule_with_details,
@@ -109,6 +110,7 @@ class MeetingCreateRequest(BaseModel):
     title: str
     organizer_id: int
     participant_ids: list[int] = []
+    optional_participant_ids: list[int] = []
     room_id: int | None = None
     priority: Literal["low", "medium", "high", "critical"] = "medium"
     local_start: str  # "YYYY-MM-DDTHH:MM", wall-clock time in `timezone`
@@ -127,13 +129,15 @@ def _book_meeting_or_409(
     title: str,
     organizer_id: int,
     participant_ids: list[int],
+    optional_participant_ids: list[int],
     room_id: int | None,
     priority: str,
     series_key: str | None,
 ) -> Meeting:
     """Shared by both booking entry points -- manual local-time entry and
-    confirming a suggested (already-UTC) slot -- so the RoomConflictError/
-    DuplicateMeetingError -> HTTPException mapping lives in one place."""
+    confirming a suggested (already-UTC) slot -- so the PersonConflictError/
+    RoomConflictError/DuplicateMeetingError -> HTTPException mapping lives
+    in one place."""
     if end_utc <= start_utc:
         raise HTTPException(status_code=400, detail="end must be after start")
     try:
@@ -146,10 +150,15 @@ def _book_meeting_or_409(
             end_utc=to_utc_z(end_utc),
             created_at_utc=to_utc_z(utc_now()),
             participant_ids=participant_ids,
+            optional_participant_ids=optional_participant_ids,
             room_id=room_id,
             priority=priority,
             series_key=series_key,
         )
+    except PersonConflictError as exc:
+        raise HTTPException(
+            status_code=409, detail="A required attendee already has a conflicting meeting."
+        ) from exc
     except RoomConflictError as exc:
         raise HTTPException(
             status_code=409, detail="That room is already booked for an overlapping time."
@@ -182,6 +191,7 @@ def post_meeting(body: MeetingCreateRequest) -> Meeting:
             title=body.title,
             organizer_id=body.organizer_id,
             participant_ids=body.participant_ids,
+            optional_participant_ids=body.optional_participant_ids,
             room_id=body.room_id,
             priority=body.priority,
             series_key=body.series_key,
@@ -192,6 +202,7 @@ class BookSlotRequest(BaseModel):
     title: str
     organizer_id: int
     participant_ids: list[int] = []
+    optional_participant_ids: list[int] = []
     room_id: int | None = None
     priority: Literal["low", "medium", "high", "critical"] = "medium"
     start_utc: str  # already UTC -- as returned by POST /api/meetings/suggest
@@ -217,6 +228,7 @@ def post_book_slot(body: BookSlotRequest) -> Meeting:
             title=body.title,
             organizer_id=body.organizer_id,
             participant_ids=body.participant_ids,
+            optional_participant_ids=body.optional_participant_ids,
             room_id=body.room_id,
             priority=body.priority,
             series_key=body.series_key,

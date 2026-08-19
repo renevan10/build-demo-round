@@ -13,7 +13,9 @@ import pytest
 
 from app.repository_meetings import (
     DuplicateMeetingError,
+    PersonConflictError,
     RoomConflictError,
+    _detail_query,
     create_meeting_idempotent,
     list_employee_schedule,
 )
@@ -139,6 +141,100 @@ def test_back_to_back_room_bookings_are_not_a_conflict(conn, base):
     assert rows["n"] == 2
 
 
+def test_required_attendee_double_booking_is_rejected(conn, base):
+    """A required attendee busy elsewhere blocks a new booking even with no
+    room involved -- this is the gap found by manually testing the live
+    API: only room conflicts were ever checked, so a person could be
+    booked into two overlapping virtual meetings with no error at all."""
+    create_meeting_idempotent(
+        conn,
+        idempotency_key="person-first",
+        title="First booking",
+        organizer_id=base["alice"],
+        start_utc="2026-02-01T10:00:00Z",
+        end_utc="2026-02-01T11:00:00Z",
+        created_at_utc="2026-01-01T00:00:00Z",
+        participant_ids=[],
+    )
+
+    with pytest.raises(PersonConflictError):
+        create_meeting_idempotent(
+            conn,
+            idempotency_key="person-overlapping",
+            title="Overlapping booking, same organizer, no room",
+            organizer_id=base["alice"],
+            start_utc="2026-02-01T10:30:00Z",
+            end_utc="2026-02-01T11:30:00Z",
+            created_at_utc="2026-01-01T00:00:01Z",
+            participant_ids=[],
+        )
+
+    rows = conn.execute(
+        "SELECT COUNT(*) AS n FROM meetings WHERE organizer_id = ? AND idempotency_key != 'person-first'",
+        (base["alice"],),
+    ).fetchone()
+    assert rows["n"] == 0, "the conflicting booking must not have been inserted"
+
+
+def test_back_to_back_person_bookings_are_not_a_conflict(conn, base):
+    first = create_meeting_idempotent(
+        conn,
+        idempotency_key="person-bb-a",
+        title="Block A",
+        organizer_id=base["alice"],
+        start_utc="2026-02-02T10:00:00Z",
+        end_utc="2026-02-02T11:00:00Z",
+        created_at_utc="2026-01-01T00:00:00Z",
+        participant_ids=[],
+    )
+    second = create_meeting_idempotent(
+        conn,
+        idempotency_key="person-bb-b",
+        title="Block B",
+        organizer_id=base["alice"],
+        start_utc="2026-02-02T11:00:00Z",
+        end_utc="2026-02-02T12:00:00Z",
+        created_at_utc="2026-01-01T00:00:01Z",
+        participant_ids=[],
+    )
+    assert first.id != second.id
+
+
+def test_optional_attendee_conflict_never_blocks_booking_and_is_recorded_as_optional(conn, base):
+    """Mirrors app/scheduling/slots.py's own rule: an optional attendee
+    never blocks feasibility, only adds cost if they're busy. That rule
+    has to hold at booking time too, not just in the suggester's ranking,
+    or the two would silently disagree."""
+    create_meeting_idempotent(
+        conn,
+        idempotency_key="optional-busy-first",
+        title="Bob's other meeting",
+        organizer_id=base["bob"],
+        start_utc="2026-02-03T10:00:00Z",
+        end_utc="2026-02-03T11:00:00Z",
+        created_at_utc="2026-01-01T00:00:00Z",
+        participant_ids=[],
+    )
+
+    meeting = create_meeting_idempotent(
+        conn,
+        idempotency_key="optional-busy-second",
+        title="New meeting, Bob invited as optional",
+        organizer_id=base["alice"],
+        start_utc="2026-02-03T10:30:00Z",
+        end_utc="2026-02-03T11:30:00Z",
+        created_at_utc="2026-01-01T00:00:01Z",
+        participant_ids=[],
+        optional_participant_ids=[base["bob"]],
+    )
+
+    role = conn.execute(
+        "SELECT attendance_role FROM meeting_participants WHERE meeting_id = ? AND employee_id = ?",
+        (meeting.id, base["bob"]),
+    ).fetchone()
+    assert role["attendance_role"] == "optional"
+
+
 def test_feedback_from_a_non_participant_is_rejected_at_the_db_level(conn, base):
     """The composite FK on meeting_feedback -> meeting_participants, not just
     meetings, is what makes "only invited employees can rate a meeting" a
@@ -196,6 +292,31 @@ def test_employee_schedule_pagination_past_the_end_is_empty_not_an_error(conn, b
     page = list_employee_schedule(conn, base["alice"], limit=10, offset=1000)
 
     assert page == []
+
+
+def test_meetings_detail_query_paginates_before_the_join_not_after(conn):
+    """Regression guard for a real bug caught by benchmarking, not by
+    reading the code: the first version of this query had a `page` CTE
+    with its own LIMIT, then joined it against `meetings` for the
+    organizer/room/participant names. That LOOKS like SQL-side pagination
+    (no Python slicing, LIMIT/OFFSET present) but SQLite's planner drove
+    the join from a full scan of `meetings` and bloom-filtered against the
+    small `page` set -- O(total meetings) per page, not O(page size). A
+    correctness test alone can't tell the two apart (both return the right
+    rows); this asserts on the query plan itself. Fixed by CROSS JOIN,
+    which forces SQLite to drive from `page` and do a primary-key lookup
+    into `meetings` per row -- confirmed flat at ~0.03ms from 2k to 200k
+    rows in manual benchmarking.
+    """
+    plan = conn.execute("EXPLAIN QUERY PLAN " + _detail_query(""), (10, 0)).fetchall()
+    ops = [row["detail"] for row in plan]
+
+    full_table_scans = {op.split()[1] for op in ops if op.startswith("SCAN")}
+    assert "m" not in full_table_scans, (
+        "the outer join must not do a full SCAN of `meetings` (m) -- "
+        f"it must drive from the small `page` CTE instead. Full plan: {ops}"
+    )
+    assert any(op == "SCAN page" for op in ops), f"expected the outer query to drive from `page`. Full plan: {ops}"
 
 
 def test_adversarial_seed_dataset_loads_without_constraint_violations(conn):

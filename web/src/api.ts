@@ -49,6 +49,7 @@ export type CreateMeetingInput = {
   title: string;
   organizer_id: number;
   participant_ids: number[];
+  optional_participant_ids: number[];
   room_id: number | null;
   priority: Priority;
   local_start: string; // "YYYY-MM-DDTHH:MM", wall-clock time in `timezone`
@@ -85,6 +86,7 @@ export type BookSlotInput = {
   title: string;
   organizer_id: number;
   participant_ids: number[];
+  optional_participant_ids: number[];
   room_id: number | null;
   priority: Priority;
   start_utc: string;
