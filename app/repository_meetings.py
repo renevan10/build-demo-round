@@ -108,7 +108,13 @@ def create_meeting_idempotent(
         conn.commit()
     except sqlite3.IntegrityError as exc:
         conn.rollback()
-        raise DuplicateMeetingError(idempotency_key) from exc
+        # Only a collision on the idempotency key means "duplicate
+        # submission" -- a CHECK (e.g. end_utc <= start_utc, bad priority)
+        # or FOREIGN KEY (unknown organizer/participant/room) violation is a
+        # different failure and must not be mislabeled as one.
+        if "idempotency_key" in str(exc):
+            raise DuplicateMeetingError(idempotency_key) from exc
+        raise
 
     return Meeting(
         meeting_id,
@@ -142,3 +148,77 @@ def list_employee_schedule(
         (employee_id, limit, offset),
     ).fetchall()
     return [Meeting(**dict(row)) for row in rows]
+
+
+@dataclass(frozen=True)
+class MeetingSummary:
+    """A meeting joined with the display names the frontend needs, instead
+    of making it stitch together id -> name lookups itself."""
+
+    id: int
+    title: str
+    organizer_id: int
+    organizer_name: str
+    start_utc: str
+    end_utc: str
+    room_id: int | None
+    room_name: str | None
+    priority: str
+    status: str
+    participant_names: list[str]
+
+
+def _row_to_summary(row: sqlite3.Row) -> MeetingSummary:
+    raw_names = row["participant_names"]
+    return MeetingSummary(
+        id=row["id"],
+        title=row["title"],
+        organizer_id=row["organizer_id"],
+        organizer_name=row["organizer_name"],
+        start_utc=row["start_utc"],
+        end_utc=row["end_utc"],
+        room_id=row["room_id"],
+        room_name=row["room_name"],
+        priority=row["priority"],
+        status=row["status"],
+        participant_names=raw_names.split("||") if raw_names else [],
+    )
+
+
+_DETAIL_QUERY = (
+    "SELECT m.id, m.title, m.organizer_id, o.name AS organizer_name, "
+    "       m.start_utc, m.end_utc, m.room_id, r.name AS room_name, "
+    "       m.priority, m.status, "
+    "       GROUP_CONCAT(p.name, '||') AS participant_names "
+    "FROM meetings m "
+    "JOIN employees o ON o.id = m.organizer_id "
+    "LEFT JOIN meeting_rooms r ON r.id = m.room_id "
+    "LEFT JOIN meeting_participants mp ON mp.meeting_id = m.id "
+    "LEFT JOIN employees p ON p.id = mp.employee_id "
+)
+
+
+def list_meetings_with_details(
+    conn: sqlite3.Connection, limit: int, offset: int = 0
+) -> list[MeetingSummary]:
+    """All meetings, soonest-first, with organizer/room/participant names
+    resolved in SQL via one query (no per-row lookups from Python)."""
+    rows = conn.execute(
+        _DETAIL_QUERY + "GROUP BY m.id ORDER BY m.start_utc LIMIT ? OFFSET ?",
+        (limit, offset),
+    ).fetchall()
+    return [_row_to_summary(row) for row in rows]
+
+
+def list_employee_schedule_with_details(
+    conn: sqlite3.Connection, employee_id: int, limit: int, offset: int = 0
+) -> list[MeetingSummary]:
+    """Same shape as list_meetings_with_details, filtered to one employee's
+    schedule (as an organizer or an invited participant)."""
+    rows = conn.execute(
+        _DETAIL_QUERY
+        + "WHERE m.id IN (SELECT meeting_id FROM meeting_participants WHERE employee_id = ?) "
+        + "GROUP BY m.id ORDER BY m.start_utc LIMIT ? OFFSET ?",
+        (employee_id, limit, offset),
+    ).fetchall()
+    return [_row_to_summary(row) for row in rows]

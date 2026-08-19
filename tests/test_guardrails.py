@@ -17,7 +17,7 @@ from app.repository_meetings import (
     create_meeting_idempotent,
     list_employee_schedule,
 )
-from app.timeutil import to_user_local, user_local_date_str
+from app.timeutil import local_wall_clock_to_utc, to_user_local, to_utc_z, user_local_date_str
 from fixtures.seed_data import seed
 
 
@@ -259,6 +259,21 @@ def test_user_local_date_can_differ_from_utc_date_near_midnight():
     assert utc_date == "2026-01-01"
     assert user_date == "2025-12-31"
     assert utc_date != user_date, "billing 'today' off the server/UTC date would charge the wrong day"
+
+
+def test_to_utc_z_matches_the_seeded_z_suffix_convention():
+    # datetime.isoformat() alone renders "+00:00", not "Z" -- a second valid
+    # spelling of the same instant that would silently break the room-
+    # overlap query, which compares start_utc/end_utc as plain strings.
+    instant = datetime(2026, 4, 1, 14, 0, 0, tzinfo=timezone.utc)
+    assert to_utc_z(instant) == "2026-04-01T14:00:00Z"
+
+
+def test_local_wall_clock_to_utc_round_trips_through_a_non_whole_hour_offset():
+    # Asia/Kolkata is UTC+5:30 -- a fixed whole-hour-offset assumption
+    # would silently drop the 30 minutes.
+    instant = local_wall_clock_to_utc("2026-02-10T14:30", "Asia/Kolkata")
+    assert to_utc_z(instant) == "2026-02-10T09:00:00Z"
 
 
 def test_end_of_month_local_date_across_a_dst_transition():
