@@ -102,12 +102,3 @@ from attending. No history (or no `series_key`) is neutral, `1.0×`.
 **Ranking.** Candidates are sorted by `(total_cost, max_cost)` — the
 `max_cost` tiebreak is the fairness mechanism: between two slots with equal
 total pain, the one that doesn't concentrate it on one person wins.
-
-## Path to production (documented, not built)
-
-SQLite is fine for the demo. The one-line pitch for what changes later: swap
-`app/db.py`'s connection factory for a pooled Postgres connection (e.g.
-`psycopg` + a connection pool), keep the same repository-function shape, and
-run the same `migrations/*.sql` files through a real migration tool (Alembic)
-instead of the hand-rolled runner. Say this out loud in the demo — you don't
-need to build it.
