@@ -1,9 +1,5 @@
 # Build & Demo round — reusable scaffold
 
-Not a project. This is the idea-agnostic skeleton you drop a chosen idea into
-once the planning session picks one, so the first 20 minutes of the real
-2-hour window aren't spent wiring up SQLite and a test runner.
-
 ## What's here
 
 | Path | What it is |
@@ -44,20 +40,6 @@ npm run dev                 # http://localhost:5173, proxies API calls to :8000
 
 `web/` targets Node 16+ (pinned to Vite 4 rather than 5 for that reason — if your
 machine has Node 18+, feel free to bump to the latest Vite/plugin-react).
-
-## How to use this for the real thing
-
-1. Rename/copy this folder for the actual idea (don't build inside `build-demo-round/` itself).
-2. Write your own migrations for your actual schema. Keep the `schema_migrations`
-   runner as-is.
-3. Build module by module: one migration + one repository function + one test +
-   one endpoint, then move to the next feature. Don't generate the whole app in
-   one prompt.
-4. Before the demo, re-read `GUARDRAILS.md` against your actual code, and keep
-   `fixtures/` adversarial — real edge cases, not happy-path rows.
-5. `web/src/App.tsx` is a placeholder health check — replace it with real screens
-   as endpoints land, and add each new route prefix to `web/vite.config.ts`'s
-   proxy table.
 
 ## How meeting cost is calculated
 
