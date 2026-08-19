@@ -32,8 +32,13 @@ from app.repository_meetings import (
     list_meetings_with_details,
     submit_feedback,
 )
-from app.dashboard import EmployeeMeetingTime, summarize_meeting_time
-from app.repository_dashboard import get_attendances_in_utc_window
+from app.dashboard import (
+    EmployeeMeetingTime,
+    UsefulnessSummary,
+    summarize_meeting_time,
+    summarize_usefulness,
+)
+from app.repository_dashboard import get_attendances_in_utc_window, get_meeting_usefulness_in_utc_window
 from app.repository_scheduling import build_employee_contexts
 from app.scheduling.slots import generate_candidate_slots, rank_slots
 from app.timeutil import local_wall_clock_to_utc, to_utc_z, utc_now
@@ -391,8 +396,7 @@ def post_meeting_feedback(meeting_id: int, body: SubmitFeedbackRequest) -> None:
 # ---- Dashboard ----
 
 
-@app.get("/api/dashboard/meeting-time")
-def get_meeting_time_dashboard(start_date: str, end_date: str) -> list[EmployeeMeetingTime]:
+def _parse_dashboard_range(start_date: str, end_date: str) -> tuple[date, date]:
     try:
         range_start = date.fromisoformat(start_date)
         range_end = date.fromisoformat(end_date)
@@ -405,24 +409,48 @@ def get_meeting_time_dashboard(start_date: str, end_date: str) -> list[EmployeeM
         raise HTTPException(
             status_code=400, detail=f"range can't exceed {MAX_DASHBOARD_RANGE.days} days"
         )
+    return range_start, range_end
 
+
+def _padded_utc_window(range_start: date, range_end: date) -> tuple[str, str]:
     # Pad the UTC fetch window by a day on each side: a meeting near the
-    # edge of the requested range can land in-range for an employee whose
-    # local date differs from UTC's (the exact naive-UTC-date bug this
+    # edge of the requested range can land in-range once converted to
+    # someone's own local date (the exact naive-UTC-date bug this
     # project's guardrails exist to catch). app/dashboard.py re-filters
-    # precisely per employee using their own timezone.
-    window_start = datetime(range_start.year, range_start.month, range_start.day, tzinfo=dt_timezone.utc) - timedelta(
-        days=1
-    )
+    # precisely using each record's own relevant timezone.
+    window_start = datetime(
+        range_start.year, range_start.month, range_start.day, tzinfo=dt_timezone.utc
+    ) - timedelta(days=1)
     window_end = datetime(
         range_end.year, range_end.month, range_end.day, tzinfo=dt_timezone.utc
     ) + timedelta(days=2)
+    return to_utc_z(window_start), to_utc_z(window_end)
+
+
+@app.get("/api/dashboard/meeting-time")
+def get_meeting_time_dashboard(start_date: str, end_date: str) -> list[EmployeeMeetingTime]:
+    range_start, range_end = _parse_dashboard_range(start_date, end_date)
+    window_start_utc, window_end_utc = _padded_utc_window(range_start, range_end)
 
     with db() as conn:
         employees = list_employees(conn)
-        attendances = get_attendances_in_utc_window(conn, to_utc_z(window_start), to_utc_z(window_end))
+        attendances = get_attendances_in_utc_window(conn, window_start_utc, window_end_utc)
 
     timezone_by_id = {e.id: e.timezone for e in employees}
     name_by_id = {e.id: e.name for e in employees}
 
     return summarize_meeting_time(attendances, timezone_by_id, name_by_id, range_start, range_end)
+
+
+@app.get("/api/dashboard/usefulness")
+def get_usefulness_dashboard(start_date: str, end_date: str) -> UsefulnessSummary:
+    range_start, range_end = _parse_dashboard_range(start_date, end_date)
+    window_start_utc, window_end_utc = _padded_utc_window(range_start, range_end)
+
+    with db() as conn:
+        employees = list_employees(conn)
+        records = get_meeting_usefulness_in_utc_window(conn, window_start_utc, window_end_utc)
+
+    timezone_by_id = {e.id: e.timezone for e in employees}
+
+    return summarize_usefulness(records, timezone_by_id, range_start, range_end, utc_now())

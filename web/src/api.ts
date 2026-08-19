@@ -96,6 +96,38 @@ export type EmployeeMeetingTime = {
   avg_hours_per_month: number;
 };
 
+export type PriorityUsefulness = {
+  priority: Priority;
+  avg_score: number | null; // null = zero ratings, not a score of zero
+  rated_meeting_count: number;
+  total_meeting_count: number;
+};
+
+export type OrganizerUsefulness = {
+  organizer_id: number;
+  organizer_name: string;
+  avg_score: number | null;
+  rated_meeting_count: number;
+  total_meeting_count: number;
+};
+
+export type LowRatedMeeting = {
+  meeting_id: number;
+  title: string;
+  priority: Priority;
+  organizer_name: string;
+  avg_score: number;
+  feedback_count: number;
+};
+
+export type UsefulnessSummary = {
+  coverage_rated: number;
+  coverage_eligible: number;
+  by_priority: PriorityUsefulness[];
+  by_organizer: OrganizerUsefulness[];
+  needs_attention: LowRatedMeeting[];
+};
+
 export type BookSlotInput = {
   title: string;
   organizer_id: number;
@@ -189,6 +221,12 @@ export function getMeetingTimeDashboard(
 ): Promise<EmployeeMeetingTime[]> {
   return getJson<EmployeeMeetingTime[]>(
     `/api/dashboard/meeting-time?start_date=${startDate}&end_date=${endDate}`,
+  );
+}
+
+export function getUsefulnessDashboard(startDate: string, endDate: string): Promise<UsefulnessSummary> {
+  return getJson<UsefulnessSummary>(
+    `/api/dashboard/usefulness?start_date=${startDate}&end_date=${endDate}`,
   );
 }
 

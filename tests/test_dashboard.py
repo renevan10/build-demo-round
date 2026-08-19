@@ -6,12 +6,17 @@ applied to reporting instead of scheduling.
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timezone
 
 import pytest
 
-from app.dashboard import MeetingAttendance, summarize_meeting_time
-from app.repository_dashboard import get_attendances_in_utc_window
+from app.dashboard import (
+    MeetingAttendance,
+    MeetingUsefulnessRecord,
+    summarize_meeting_time,
+    summarize_usefulness,
+)
+from app.repository_dashboard import get_attendances_in_utc_window, get_meeting_usefulness_in_utc_window
 
 
 def test_total_hours_and_meeting_count_for_a_single_attendance():
@@ -134,3 +139,159 @@ def test_cancelled_meetings_are_excluded_from_the_utc_window_fetch(conn):
     attendances = get_attendances_in_utc_window(conn, "2026-01-01T00:00:00Z", "2026-01-31T00:00:00Z")
 
     assert attendances == [], "a cancelled meeting must not count toward anyone's meeting time"
+
+
+NOW = datetime(2026, 6, 1, tzinfo=timezone.utc)  # after everything below has already happened
+
+
+def _record(
+    meeting_id, priority, organizer_id=1, organizer_name="Alice", feedback_count=0, feedback_sum=0
+) -> MeetingUsefulnessRecord:
+    return MeetingUsefulnessRecord(
+        meeting_id=meeting_id,
+        title=f"Meeting {meeting_id}",
+        priority=priority,
+        organizer_id=organizer_id,
+        organizer_name=organizer_name,
+        start_utc="2026-01-05T10:00:00Z",
+        end_utc="2026-01-05T10:30:00Z",
+        feedback_count=feedback_count,
+        feedback_sum=feedback_sum,
+    )
+
+
+def test_by_priority_average_is_weighted_by_rating_count_not_averaged_per_meeting():
+    """Meeting A: one rating of 5. Meeting B: three ratings summing to 3
+    (avg 1 each). Naive average-of-per-meeting-averages gives (5+1)/2=3.0;
+    the correct rating-weighted average is (5+1+1+1)/4=2.0. This is
+    exactly why the repository query returns (count, sum) per meeting
+    instead of a pre-averaged score."""
+    records = [
+        _record(1, "high", feedback_count=1, feedback_sum=5),
+        _record(2, "high", feedback_count=3, feedback_sum=3),
+    ]
+
+    summary = summarize_usefulness(
+        records, organizer_timezones={1: "UTC"}, range_start_date=date(2026, 1, 1), range_end_date=date(2026, 1, 31), now_utc=NOW
+    )
+
+    high = next(p for p in summary.by_priority if p.priority == "high")
+    assert high.avg_score == 2.0
+    assert high.rated_meeting_count == 2
+    assert high.total_meeting_count == 2
+
+
+def test_avg_score_is_none_not_zero_when_a_priority_has_no_ratings():
+    records = [_record(1, "low", feedback_count=0, feedback_sum=0)]
+
+    summary = summarize_usefulness(
+        records, organizer_timezones={1: "UTC"}, range_start_date=date(2026, 1, 1), range_end_date=date(2026, 1, 31), now_utc=NOW
+    )
+
+    low = next(p for p in summary.by_priority if p.priority == "low")
+    assert low.avg_score is None, "zero ratings must be None, not a misleading score of 0.0"
+    assert low.total_meeting_count == 1
+    assert low.rated_meeting_count == 0
+
+    critical = next(p for p in summary.by_priority if p.priority == "critical")
+    assert critical.total_meeting_count == 0
+    assert critical.avg_score is None
+
+
+def test_a_meeting_that_has_not_happened_yet_is_excluded_from_coverage():
+    future = MeetingUsefulnessRecord(
+        meeting_id=1,
+        title="Future meeting",
+        priority="high",
+        organizer_id=1,
+        organizer_name="Alice",
+        start_utc="2026-01-05T10:00:00Z",
+        end_utc="2026-01-05T10:30:00Z",
+        feedback_count=0,
+        feedback_sum=0,
+    )
+    # now_utc is BEFORE this meeting's end -- it hasn't happened yet
+    now_before_meeting = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    summary = summarize_usefulness(
+        [future],
+        organizer_timezones={1: "UTC"},
+        range_start_date=date(2026, 1, 1),
+        range_end_date=date(2026, 1, 31),
+        now_utc=now_before_meeting,
+    )
+
+    assert summary.coverage_eligible == 0, "a meeting that hasn't happened yet must not count as eligible for feedback"
+
+
+def test_needs_attention_only_high_and_critical_sorted_ascending_by_score():
+    records = [
+        _record(1, "critical", feedback_count=2, feedback_sum=8),  # avg 4.0
+        _record(2, "high", feedback_count=1, feedback_sum=1),  # avg 1.0
+        _record(3, "low", feedback_count=1, feedback_sum=1),  # low priority -- excluded regardless of score
+        _record(4, "critical", feedback_count=1, feedback_sum=2),  # avg 2.0
+    ]
+
+    summary = summarize_usefulness(
+        records, organizer_timezones={1: "UTC"}, range_start_date=date(2026, 1, 1), range_end_date=date(2026, 1, 31), now_utc=NOW
+    )
+
+    assert [m.meeting_id for m in summary.needs_attention] == [2, 4, 1]
+    assert all(m.priority in ("high", "critical") for m in summary.needs_attention)
+
+
+def test_usefulness_range_filter_uses_the_organizers_own_local_date():
+    # Same cross-midnight case as the meeting-time dashboard tests: UTC
+    # Jan 4 19:00 is already Jan 5 in Asia/Kolkata (+5:30).
+    record = MeetingUsefulnessRecord(
+        meeting_id=1,
+        title="Cross-midnight meeting",
+        priority="medium",
+        organizer_id=1,
+        organizer_name="Priya",
+        start_utc="2026-01-04T19:00:00Z",
+        end_utc="2026-01-04T19:30:00Z",
+        feedback_count=1,
+        feedback_sum=4,
+    )
+
+    summary = summarize_usefulness(
+        [record],
+        organizer_timezones={1: "Asia/Kolkata"},
+        range_start_date=date(2026, 1, 5),
+        range_end_date=date(2026, 1, 5),
+        now_utc=NOW,
+    )
+
+    medium = next(p for p in summary.by_priority if p.priority == "medium")
+    assert medium.total_meeting_count == 1, "must count toward the organizer's local date (Jan 5), not UTC's (Jan 4)"
+
+
+def test_cancelled_meetings_are_excluded_from_the_usefulness_fetch(conn):
+    from app.repository_meetings import create_meeting_idempotent
+
+    office_id = conn.execute(
+        "INSERT INTO offices (name, city, timezone) VALUES ('HQ', 'Testville', 'UTC')"
+    ).lastrowid
+    alice_id = conn.execute(
+        "INSERT INTO employees (name, email, timezone, office_id) VALUES ('Alice', 'a@t.dev', 'UTC', ?)",
+        (office_id,),
+    ).lastrowid
+    conn.commit()
+
+    meeting = create_meeting_idempotent(
+        conn,
+        idempotency_key="usefulness-cancel-check",
+        title="Will be cancelled",
+        organizer_id=alice_id,
+        start_utc="2026-01-05T10:00:00Z",
+        end_utc="2026-01-05T11:00:00Z",
+        created_at_utc="2026-01-01T00:00:00Z",
+        participant_ids=[],
+    )
+    conn.execute("UPDATE meetings SET status = 'cancelled' WHERE id = ?", (meeting.id,))
+    conn.commit()
+
+    records = get_meeting_usefulness_in_utc_window(conn, "2026-01-01T00:00:00Z", "2026-01-31T00:00:00Z")
+
+    assert records == [], "a cancelled meeting must not appear in usefulness analytics"
