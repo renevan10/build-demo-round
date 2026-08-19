@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 import pytest
 
 from app.repository_meetings import (
+    BlackoutConflictError,
     DuplicateMeetingError,
     PersonConflictError,
     RoomConflictError,
@@ -233,6 +234,96 @@ def test_optional_attendee_conflict_never_blocks_booking_and_is_recorded_as_opti
         (meeting.id, base["bob"]),
     ).fetchone()
     assert role["attendance_role"] == "optional"
+
+
+def test_blackout_blocks_required_attendee_booking(conn, base):
+    """Manual booking previously ignored blackouts entirely -- confirmed
+    live by booking a real employee directly on her blackout date and
+    getting a 201. This is the DB-level fix for that gap."""
+    conn.execute(
+        "INSERT INTO blackouts (employee_id, local_date, reason) VALUES (?, '2026-02-05', 'PTO')",
+        (base["alice"],),
+    )
+    conn.commit()
+
+    with pytest.raises(BlackoutConflictError):
+        create_meeting_idempotent(
+            conn,
+            idempotency_key="blackout-blocked",
+            title="Should be rejected",
+            organizer_id=base["alice"],
+            start_utc="2026-02-05T10:00:00Z",
+            end_utc="2026-02-05T10:30:00Z",
+            created_at_utc="2026-01-01T00:00:00Z",
+            participant_ids=[],
+        )
+
+
+def test_blackout_does_not_block_a_different_date(conn, base):
+    conn.execute(
+        "INSERT INTO blackouts (employee_id, local_date, reason) VALUES (?, '2026-02-05', 'PTO')",
+        (base["alice"],),
+    )
+    conn.commit()
+
+    meeting = create_meeting_idempotent(
+        conn,
+        idempotency_key="blackout-different-day",
+        title="Should be fine",
+        organizer_id=base["alice"],
+        start_utc="2026-02-06T10:00:00Z",
+        end_utc="2026-02-06T10:30:00Z",
+        created_at_utc="2026-01-01T00:00:00Z",
+        participant_ids=[],
+    )
+    assert meeting.id is not None
+
+
+def test_optional_attendee_blackout_does_not_block_booking(conn, base):
+    """Same never-blocks rule as an optional attendee's meeting conflict --
+    a blackout is a preference/unavailability signal for someone who isn't
+    required, not a hard stop."""
+    conn.execute(
+        "INSERT INTO blackouts (employee_id, local_date, reason) VALUES (?, '2026-02-07', 'PTO')",
+        (base["bob"],),
+    )
+    conn.commit()
+
+    meeting = create_meeting_idempotent(
+        conn,
+        idempotency_key="blackout-optional-ignored",
+        title="Bob invited as optional despite his blackout",
+        organizer_id=base["alice"],
+        start_utc="2026-02-07T10:00:00Z",
+        end_utc="2026-02-07T10:30:00Z",
+        created_at_utc="2026-01-01T00:00:00Z",
+        participant_ids=[],
+        optional_participant_ids=[base["bob"]],
+    )
+    assert meeting.id is not None
+
+
+def test_blackout_enforcement_against_the_real_seeded_dataset(conn):
+    """Priya's seeded blackout (2026-03-10, Asia/Kolkata) is the exact
+    scenario manual testing found unenforced. Books her directly, in her
+    own local time, on that date -- proves the timezone-aware local-date
+    conversion is right, not just a UTC-only fixture coincidence."""
+    seed(conn)
+    priya_id = conn.execute("SELECT id FROM employees WHERE email = 'priya@example.com'").fetchone()["id"]
+
+    with pytest.raises(BlackoutConflictError) as exc_info:
+        create_meeting_idempotent(
+            conn,
+            idempotency_key="priya-blackout-check",
+            title="Should be rejected",
+            organizer_id=priya_id,
+            # 10:00 IST on 2026-03-10 = 04:30 UTC
+            start_utc="2026-03-10T04:30:00Z",
+            end_utc="2026-03-10T05:00:00Z",
+            created_at_utc="2026-01-01T00:00:00Z",
+            participant_ids=[],
+        )
+    assert exc_info.value.local_date == "2026-03-10"
 
 
 def test_feedback_from_a_non_participant_is_rejected_at_the_db_level(conn, base):

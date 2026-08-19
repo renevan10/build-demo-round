@@ -21,6 +21,7 @@ from app.repository_directory import (
     list_offices,
 )
 from app.repository_meetings import (
+    BlackoutConflictError,
     DuplicateMeetingError,
     Meeting,
     MeetingSummary,
@@ -155,6 +156,10 @@ def _book_meeting_or_409(
             priority=priority,
             series_key=series_key,
         )
+    except BlackoutConflictError as exc:
+        raise HTTPException(
+            status_code=409, detail="A required attendee is unavailable (blacked out) on that date."
+        ) from exc
     except PersonConflictError as exc:
         raise HTTPException(
             status_code=409, detail="A required attendee already has a conflicting meeting."

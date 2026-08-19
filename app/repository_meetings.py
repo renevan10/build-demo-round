@@ -9,6 +9,9 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass
+from datetime import datetime
+
+from app.timeutil import to_user_local
 
 
 class DuplicateMeetingError(Exception):
@@ -31,6 +34,13 @@ class PersonConflictError(Exception):
             f"employee {employee_id} already has a conflicting meeting during [{start_utc}, {end_utc})"
         )
         self.employee_id = employee_id
+
+
+class BlackoutConflictError(Exception):
+    def __init__(self, employee_id: int, local_date: str):
+        super().__init__(f"employee {employee_id} is blacked out on {local_date}")
+        self.employee_id = employee_id
+        self.local_date = local_date
 
 
 @dataclass(frozen=True)
@@ -84,10 +94,19 @@ def create_meeting_idempotent(
     A meeting ending exactly when another starts does NOT conflict.
 
     Only the organizer and *required* participant_ids are hard-checked for
-    a person conflict -- mirroring app/scheduling/slots.py's own rule that
-    an optional attendee never blocks a slot, only adds cost if they
-    happen to be busy. optional_participant_ids are recorded with
-    attendance_role='optional' and never block booking.
+    a person conflict or a blackout date -- mirroring app/scheduling/
+    slots.py's own rule that an optional attendee never blocks a slot,
+    only adds cost if they happen to be busy. optional_participant_ids
+    are recorded with attendance_role='optional' and never block booking.
+
+    The blackout check is the odd one out here: unlike a room or a person,
+    a blackout date isn't something a concurrent request could be racing
+    to create, so it doesn't strictly need BEGIN IMMEDIATE's write lock --
+    it's checked inside the same transaction anyway so every "can this
+    booking happen" rule lives in one place. It also needs each attendee's
+    own timezone (blackouts.local_date is a *local* calendar date), which
+    the room/person checks never needed since those only compare UTC
+    strings.
     """
     required_attendees = set(participant_ids) | {organizer_id}
     optional_attendees = set(optional_participant_ids or ()) - required_attendees
@@ -95,6 +114,33 @@ def create_meeting_idempotent(
     conn.execute("BEGIN IMMEDIATE")
     try:
         placeholders = ",".join("?" * len(required_attendees))
+
+        blackout_rows = conn.execute(
+            f"SELECT e.id AS employee_id, e.timezone, b.local_date "
+            f"FROM employees e JOIN blackouts b ON b.employee_id = e.id "
+            f"WHERE e.id IN ({placeholders})",
+            tuple(required_attendees),
+        ).fetchall()
+        blackout_dates_by_employee: dict[int, set[str]] = {}
+        timezone_by_employee: dict[int, str] = {}
+        for row in blackout_rows:
+            blackout_dates_by_employee.setdefault(row["employee_id"], set()).add(row["local_date"])
+            timezone_by_employee[row["employee_id"]] = row["timezone"]
+
+        if blackout_dates_by_employee:
+            start_dt = datetime.fromisoformat(start_utc.replace("Z", "+00:00"))
+            end_dt = datetime.fromisoformat(end_utc.replace("Z", "+00:00"))
+            for employee_id, blackout_dates in blackout_dates_by_employee.items():
+                tz = timezone_by_employee[employee_id]
+                touched_dates = {
+                    to_user_local(start_dt, tz).date().isoformat(),
+                    to_user_local(end_dt, tz).date().isoformat(),
+                }
+                hit = touched_dates & blackout_dates
+                if hit:
+                    conn.rollback()
+                    raise BlackoutConflictError(employee_id, next(iter(hit)))
+
         person_conflict = conn.execute(
             f"SELECT mp.employee_id FROM meetings m "
             f"JOIN meeting_participants mp ON mp.meeting_id = m.id "
