@@ -14,7 +14,13 @@ MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "migrations"
 
 
 def connect(db_path: str) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path)
+    # isolation_level=None puts the connection in autocommit mode, so the
+    # sqlite3 module never opens an implicit transaction ahead of a DML
+    # statement. Without this, an explicit `BEGIN IMMEDIATE` (see
+    # app/repository_meetings.py) fails with "cannot start a transaction
+    # within a transaction" the moment an earlier, uncommitted INSERT has
+    # already opened one -- every transaction boundary here is explicit.
+    conn = sqlite3.connect(db_path, isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA journal_mode = WAL")

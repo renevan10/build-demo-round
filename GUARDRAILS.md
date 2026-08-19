@@ -7,13 +7,18 @@ and that interviewers are told to look for.
 - [ ] **Uniqueness is enforced at the DB level**, not with a check-then-insert
       (`SELECT ... ; if not exists: INSERT`). That pattern race-conditions
       under concurrent requests. Use a `UNIQUE` constraint/index and catch the
-      integrity error. See `app/repository_example.py::create_idempotent`.
+      integrity error. See `app/repository_meetings.py::create_meeting_idempotent`.
 - [ ] **No code path reads the server's local clock or local timezone** for
       anything user-facing. Store UTC, take the user's timezone as an explicit
       parameter, convert at the edge. See `app/timeutil.py`.
 - [ ] **No query pulls a full table into memory to filter/paginate in Python.**
       Filter, sort, and `LIMIT`/`OFFSET` in SQL. See
-      `app/repository_example.py::list_paginated`.
+      `app/repository_meetings.py::list_employee_schedule`.
+- [ ] **A resource only one party can use at a time (a meeting room) is
+      protected against a genuine race, not a check-then-insert that only
+      looks safe in a single-threaded demo.** See
+      `app/repository_meetings.py::create_meeting_idempotent`'s `BEGIN IMMEDIATE`
+      + overlap query, and why `app/db.py::connect` sets `isolation_level=None`.
 - [ ] **Date-math edge cases are tested, not assumed** — end-of-month billing
       on the 31st into a 30-day (or 28/29-day) month, DST transitions if you
       touch local time anywhere, leap years if you touch Feb.

@@ -1,47 +1,245 @@
-"""Proves the three patterns in GUARDRAILS.md actually hold.
+"""Proves the guardrails in GUARDRAILS.md actually hold against the real schema.
 
-These are the tests worth keeping around as a template: each one exists to
-disprove a specific lazy-AI shortcut, not just to exercise happy-path code.
+Each test exists to disprove a specific lazy-AI shortcut, not just to
+exercise happy-path code.
 """
 
 from __future__ import annotations
 
+import sqlite3
 from datetime import datetime, timezone
 
 import pytest
 
-from app.repository_example import DuplicateEventError, create_idempotent, list_paginated
+from app.repository_meetings import (
+    DuplicateMeetingError,
+    RoomConflictError,
+    create_meeting_idempotent,
+    list_employee_schedule,
+)
 from app.timeutil import to_user_local, user_local_date_str
+from fixtures.seed_data import seed
 
 
-def test_duplicate_idempotency_key_is_rejected_not_double_inserted(conn):
-    create_idempotent(conn, "key-1", "first payload", "2026-01-01T00:00:00Z")
+@pytest.fixture
+def base(conn: sqlite3.Connection) -> dict[str, int]:
+    """One office/two employees/one room -- just enough to hang meetings off."""
+    office_id = conn.execute(
+        "INSERT INTO offices (name, city, timezone) VALUES ('HQ', 'Testville', 'UTC')"
+    ).lastrowid
+    alice_id = conn.execute(
+        "INSERT INTO employees (name, email, timezone, office_id) VALUES "
+        "('Alice', 'alice@test.dev', 'UTC', ?)",
+        (office_id,),
+    ).lastrowid
+    bob_id = conn.execute(
+        "INSERT INTO employees (name, email, timezone, office_id) VALUES "
+        "('Bob', 'bob@test.dev', 'UTC', ?)",
+        (office_id,),
+    ).lastrowid
+    room_id = conn.execute(
+        "INSERT INTO meeting_rooms (office_id, name, capacity) VALUES (?, 'Room A', 4)",
+        (office_id,),
+    ).lastrowid
+    conn.commit()
+    return {"office": office_id, "alice": alice_id, "bob": bob_id, "room": room_id}
 
-    with pytest.raises(DuplicateEventError):
-        create_idempotent(conn, "key-1", "second payload", "2026-01-01T00:00:05Z")
+
+def test_duplicate_idempotency_key_is_rejected_not_double_inserted(conn, base):
+    create_meeting_idempotent(
+        conn,
+        idempotency_key="key-1",
+        title="Sync",
+        organizer_id=base["alice"],
+        start_utc="2026-01-05T10:00:00Z",
+        end_utc="2026-01-05T10:30:00Z",
+        created_at_utc="2026-01-01T00:00:00Z",
+        participant_ids=[base["bob"]],
+    )
+
+    with pytest.raises(DuplicateMeetingError):
+        create_meeting_idempotent(
+            conn,
+            idempotency_key="key-1",
+            title="Sync (resubmitted)",
+            organizer_id=base["alice"],
+            start_utc="2026-01-05T11:00:00Z",
+            end_utc="2026-01-05T11:30:00Z",
+            created_at_utc="2026-01-01T00:00:05Z",
+            participant_ids=[base["bob"]],
+        )
 
     rows = conn.execute(
-        "SELECT COUNT(*) AS n FROM demo_events WHERE idempotency_key = ?", ("key-1",)
+        "SELECT COUNT(*) AS n FROM meetings WHERE idempotency_key = ?", ("key-1",)
     ).fetchone()
     assert rows["n"] == 1, "check-then-insert would let a race produce 2 rows here"
 
 
-def test_pagination_returns_correct_slice_without_full_scan(conn):
+def test_room_double_booking_is_rejected_not_a_race(conn, base):
+    create_meeting_idempotent(
+        conn,
+        idempotency_key="room-first",
+        title="First booking",
+        organizer_id=base["alice"],
+        start_utc="2026-01-06T10:00:00Z",
+        end_utc="2026-01-06T11:00:00Z",
+        created_at_utc="2026-01-01T00:00:00Z",
+        participant_ids=[],
+        room_id=base["room"],
+    )
+
+    with pytest.raises(RoomConflictError):
+        create_meeting_idempotent(
+            conn,
+            idempotency_key="room-overlapping",
+            title="Overlapping booking",
+            organizer_id=base["bob"],
+            start_utc="2026-01-06T10:30:00Z",
+            end_utc="2026-01-06T11:30:00Z",
+            created_at_utc="2026-01-01T00:00:01Z",
+            participant_ids=[],
+            room_id=base["room"],
+        )
+
+    rows = conn.execute(
+        "SELECT COUNT(*) AS n FROM meetings WHERE room_id = ?", (base["room"],)
+    ).fetchone()
+    assert rows["n"] == 1, "the conflicting booking must not have been inserted"
+
+
+def test_back_to_back_room_bookings_are_not_a_conflict(conn, base):
+    """B starts exactly when A ends -- >= not >, no false-positive overlap."""
+    first = create_meeting_idempotent(
+        conn,
+        idempotency_key="bb-a",
+        title="Block A",
+        organizer_id=base["alice"],
+        start_utc="2026-01-07T10:00:00Z",
+        end_utc="2026-01-07T11:00:00Z",
+        created_at_utc="2026-01-01T00:00:00Z",
+        participant_ids=[],
+        room_id=base["room"],
+    )
+    second = create_meeting_idempotent(
+        conn,
+        idempotency_key="bb-b",
+        title="Block B",
+        organizer_id=base["bob"],
+        start_utc="2026-01-07T11:00:00Z",
+        end_utc="2026-01-07T12:00:00Z",
+        created_at_utc="2026-01-01T00:00:01Z",
+        participant_ids=[],
+        room_id=base["room"],
+    )
+
+    assert first.id != second.id
+    rows = conn.execute(
+        "SELECT COUNT(*) AS n FROM meetings WHERE room_id = ?", (base["room"],)
+    ).fetchone()
+    assert rows["n"] == 2
+
+
+def test_feedback_from_a_non_participant_is_rejected_at_the_db_level(conn, base):
+    """The composite FK on meeting_feedback -> meeting_participants, not just
+    meetings, is what makes "only invited employees can rate a meeting" a
+    schema-enforced invariant rather than an app-layer check to remember."""
+    meeting = create_meeting_idempotent(
+        conn,
+        idempotency_key="fk-check",
+        title="Alice-only sync",
+        organizer_id=base["alice"],
+        start_utc="2026-01-08T10:00:00Z",
+        end_utc="2026-01-08T10:30:00Z",
+        created_at_utc="2026-01-01T00:00:00Z",
+        participant_ids=[],  # bob is never invited
+    )
+
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "INSERT INTO meeting_feedback (meeting_id, employee_id, usefulness_score, submitted_at_utc) "
+            "VALUES (?, ?, 5, '2026-01-08T11:00:00Z')",
+            (meeting.id, base["bob"]),
+        )
+
+
+def test_employee_schedule_pagination_returns_correct_slice_without_full_scan(conn, base):
     for i in range(25):
-        create_idempotent(conn, f"key-{i}", f"payload-{i}", "2026-01-01T00:00:00Z")
+        create_meeting_idempotent(
+            conn,
+            idempotency_key=f"page-{i}",
+            title=f"Meeting {i}",
+            organizer_id=base["alice"],
+            start_utc=f"2026-02-{i + 1:02d}T09:00:00Z",
+            end_utc=f"2026-02-{i + 1:02d}T09:30:00Z",
+            created_at_utc="2026-01-01T00:00:00Z",
+            participant_ids=[base["bob"]],
+        )
 
-    page = list_paginated(conn, limit=10, offset=20)
+    page = list_employee_schedule(conn, base["alice"], limit=10, offset=20)
 
-    assert [e.idempotency_key for e in page] == [f"key-{i}" for i in range(20, 25)]
+    assert [m.idempotency_key for m in page] == [f"page-{i}" for i in range(20, 25)]
     assert len(page) == 5
 
 
-def test_pagination_past_the_end_is_empty_not_an_error(conn):
-    create_idempotent(conn, "only-key", "payload", "2026-01-01T00:00:00Z")
+def test_employee_schedule_pagination_past_the_end_is_empty_not_an_error(conn, base):
+    create_meeting_idempotent(
+        conn,
+        idempotency_key="only-meeting",
+        title="Only one",
+        organizer_id=base["alice"],
+        start_utc="2026-01-09T10:00:00Z",
+        end_utc="2026-01-09T10:30:00Z",
+        created_at_utc="2026-01-01T00:00:00Z",
+        participant_ids=[base["bob"]],
+    )
 
-    page = list_paginated(conn, limit=10, offset=1000)
+    page = list_employee_schedule(conn, base["alice"], limit=10, offset=1000)
 
     assert page == []
+
+
+def test_adversarial_seed_dataset_loads_without_constraint_violations(conn):
+    """Runs the full hand-authored dataset end to end: +5:30 offsets, a
+    Sunday-Thursday work week, a meeting on the DST transition instant, and
+    back-to-back room bookings all have to satisfy every CHECK/FK/UNIQUE
+    constraint at once, not just in isolation."""
+    seed(conn)
+
+    counts = {
+        table: conn.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"]
+        for table in (
+            "offices",
+            "employees",
+            "meeting_rooms",
+            "meetings",
+            "meeting_participants",
+            "meeting_feedback",
+        )
+    }
+    assert counts["offices"] == 3
+    assert counts["employees"] == 6
+    assert counts["meetings"] == 7
+    assert counts["meeting_feedback"] == 6
+
+    rohan_id = conn.execute(
+        "SELECT id FROM employees WHERE email = 'rohan@example.com'"
+    ).fetchone()["id"]
+    friday_row = conn.execute(
+        "SELECT 1 FROM working_hours WHERE employee_id = ? AND day_of_week = 5", (rohan_id,)
+    ).fetchone()
+    assert friday_row is None, "Rohan's Sunday-Thursday week must not have a Friday row"
+
+    critical_id = conn.execute(
+        "SELECT id FROM meetings WHERE idempotency_key = 'seed-critical-low-value'"
+    ).fetchone()["id"]
+    scores = [
+        row["usefulness_score"]
+        for row in conn.execute(
+            "SELECT usefulness_score FROM meeting_feedback WHERE meeting_id = ? ORDER BY employee_id",
+            (critical_id,),
+        )
+    ]
+    assert scores == [2, 1, 2, 3], "seeded as a low-usefulness critical meeting"
 
 
 def test_naive_datetime_is_rejected_not_silently_treated_as_utc():
