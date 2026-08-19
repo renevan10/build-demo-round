@@ -37,6 +37,7 @@ class Meeting:
     status: str
     idempotency_key: str
     created_at_utc: str
+    series_key: str | None = None
 
 
 def create_meeting_idempotent(
@@ -51,6 +52,7 @@ def create_meeting_idempotent(
     participant_ids: list[int],
     room_id: int | None = None,
     priority: str = "medium",
+    series_key: str | None = None,
 ) -> Meeting:
     """Insert a meeting plus its participants, race-safe on both axes.
 
@@ -85,7 +87,7 @@ def create_meeting_idempotent(
         cursor = conn.execute(
             "INSERT INTO meetings "
             "(title, organizer_id, start_utc, end_utc, room_id, priority, "
-            " idempotency_key, created_at_utc) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            " idempotency_key, created_at_utc, series_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 title,
                 organizer_id,
@@ -95,6 +97,7 @@ def create_meeting_idempotent(
                 priority,
                 idempotency_key,
                 created_at_utc,
+                series_key,
             ),
         )
         meeting_id = cursor.lastrowid
@@ -127,6 +130,7 @@ def create_meeting_idempotent(
         "scheduled",
         idempotency_key,
         created_at_utc,
+        series_key,
     )
 
 
@@ -140,7 +144,7 @@ def list_employee_schedule(
     """
     rows = conn.execute(
         "SELECT m.id, m.title, m.organizer_id, m.start_utc, m.end_utc, m.room_id, "
-        "       m.priority, m.status, m.idempotency_key, m.created_at_utc "
+        "       m.priority, m.status, m.idempotency_key, m.created_at_utc, m.series_key "
         "FROM meetings m "
         "JOIN meeting_participants mp ON mp.meeting_id = m.id "
         "WHERE mp.employee_id = ? "

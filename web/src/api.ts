@@ -55,6 +55,42 @@ export type CreateMeetingInput = {
   local_end: string;
   timezone: string;
   idempotency_key: string;
+  series_key: string | null;
+};
+
+export type SuggestSlotsInput = {
+  required_ids: number[];
+  optional_ids: number[];
+  duration_minutes: number;
+  search_start_local: string; // "YYYY-MM-DDTHH:MM", wall-clock time in `timezone`
+  search_end_local: string;
+  timezone: string;
+  granularity_minutes: number;
+  series_key: string | null;
+  max_results: number;
+};
+
+export type SlotCost = { employee_id: number; employee_name: string; cost: number };
+
+export type RankedSlot = {
+  start_utc: string;
+  end_utc: string;
+  total_cost: number;
+  max_cost: number;
+  required_costs: SlotCost[];
+  optional_costs: SlotCost[];
+};
+
+export type BookSlotInput = {
+  title: string;
+  organizer_id: number;
+  participant_ids: number[];
+  room_id: number | null;
+  priority: Priority;
+  start_utc: string;
+  end_utc: string;
+  idempotency_key: string;
+  series_key: string | null;
 };
 
 export class ApiError extends Error {
@@ -115,14 +151,26 @@ export function getEmployeeSchedule(
   );
 }
 
-export async function createMeeting(input: CreateMeetingInput): Promise<Meeting> {
-  const res = await fetch("/api/meetings", {
+async function postJson<T>(path: string, body: unknown): Promise<T> {
+  const res = await fetch(path, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(input),
+    body: JSON.stringify(body),
   });
   if (!res.ok) {
     throw new ApiError(res.status, await extractDetail(res));
   }
   return res.json();
+}
+
+export function createMeeting(input: CreateMeetingInput): Promise<Meeting> {
+  return postJson<Meeting>("/api/meetings", input);
+}
+
+export function suggestMeetingSlots(input: SuggestSlotsInput): Promise<RankedSlot[]> {
+  return postJson<RankedSlot[]>("/api/meetings/suggest", input);
+}
+
+export function bookSlot(input: BookSlotInput): Promise<Meeting> {
+  return postJson<Meeting>("/api/meetings/book-slot", input);
 }

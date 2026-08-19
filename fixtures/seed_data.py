@@ -209,6 +209,7 @@ def _seed_meetings(
         participant_ids=[e["alice"], e["bob"], e["emma"], e["david"]],
         room_id=r["hudson"],
         priority="critical",
+        series_key="weekly-status-review",
     )
     conn.execute("UPDATE meetings SET status = 'completed' WHERE id = ?", (critical.id,))
     conn.executemany(
@@ -235,6 +236,7 @@ def _seed_meetings(
         participant_ids=[e["priya"], e["rohan"]],
         room_id=None,
         priority="low",
+        series_key="priya-rohan-1on1",
     )
     conn.execute("UPDATE meetings SET status = 'completed' WHERE id = ?", (valuable.id,))
     conn.executemany(

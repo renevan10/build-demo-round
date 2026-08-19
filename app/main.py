@@ -5,10 +5,11 @@ from __future__ import annotations
 import os
 import sqlite3
 from contextlib import asynccontextmanager, contextmanager
+from datetime import datetime, timedelta, timezone as dt_timezone
 from typing import Iterator, Literal
 
 from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.db import connect, run_migrations
 from app.repository_directory import (
@@ -28,7 +29,18 @@ from app.repository_meetings import (
     list_employee_schedule_with_details,
     list_meetings_with_details,
 )
+from app.repository_scheduling import build_employee_contexts
+from app.scheduling.slots import generate_candidate_slots, rank_slots
 from app.timeutil import local_wall_clock_to_utc, to_utc_z, utc_now
+
+MAX_SEARCH_WINDOW = timedelta(days=14)
+
+
+def _parse_utc_z(instant_z: str) -> datetime:
+    parsed = datetime.fromisoformat(instant_z.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        raise ValueError(f"{instant_z!r} is not a UTC instant")
+    return parsed.astimezone(dt_timezone.utc)
 
 DB_PATH = os.environ.get("APP_DB_PATH", "app.db")
 
@@ -103,34 +115,41 @@ class MeetingCreateRequest(BaseModel):
     local_end: str
     timezone: str
     idempotency_key: str
+    series_key: str | None = None
 
 
-@app.post("/api/meetings", status_code=201)
-def post_meeting(body: MeetingCreateRequest) -> Meeting:
-    try:
-        start_utc = local_wall_clock_to_utc(body.local_start, body.timezone)
-        end_utc = local_wall_clock_to_utc(body.local_end, body.timezone)
-    except (ValueError, KeyError) as exc:
-        # KeyError is what ZoneInfo raises for an unknown IANA name.
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
+def _book_meeting_or_409(
+    conn: sqlite3.Connection,
+    *,
+    start_utc,
+    end_utc,
+    idempotency_key: str,
+    title: str,
+    organizer_id: int,
+    participant_ids: list[int],
+    room_id: int | None,
+    priority: str,
+    series_key: str | None,
+) -> Meeting:
+    """Shared by both booking entry points -- manual local-time entry and
+    confirming a suggested (already-UTC) slot -- so the RoomConflictError/
+    DuplicateMeetingError -> HTTPException mapping lives in one place."""
     if end_utc <= start_utc:
         raise HTTPException(status_code=400, detail="end must be after start")
-
     try:
-        with db() as conn:
-            return create_meeting_idempotent(
-                conn,
-                idempotency_key=body.idempotency_key,
-                title=body.title,
-                organizer_id=body.organizer_id,
-                start_utc=to_utc_z(start_utc),
-                end_utc=to_utc_z(end_utc),
-                created_at_utc=to_utc_z(utc_now()),
-                participant_ids=body.participant_ids,
-                room_id=body.room_id,
-                priority=body.priority,
-            )
+        return create_meeting_idempotent(
+            conn,
+            idempotency_key=idempotency_key,
+            title=title,
+            organizer_id=organizer_id,
+            start_utc=to_utc_z(start_utc),
+            end_utc=to_utc_z(end_utc),
+            created_at_utc=to_utc_z(utc_now()),
+            participant_ids=participant_ids,
+            room_id=room_id,
+            priority=priority,
+            series_key=series_key,
+        )
     except RoomConflictError as exc:
         raise HTTPException(
             status_code=409, detail="That room is already booked for an overlapping time."
@@ -143,6 +162,153 @@ def post_meeting(body: MeetingCreateRequest) -> Meeting:
         # Unknown organizer/participant/room id, or a CHECK violation that
         # slipped past validation above (belt and suspenders).
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/meetings", status_code=201)
+def post_meeting(body: MeetingCreateRequest) -> Meeting:
+    try:
+        start_utc = local_wall_clock_to_utc(body.local_start, body.timezone)
+        end_utc = local_wall_clock_to_utc(body.local_end, body.timezone)
+    except (ValueError, KeyError) as exc:
+        # KeyError is what ZoneInfo raises for an unknown IANA name.
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    with db() as conn:
+        return _book_meeting_or_409(
+            conn,
+            start_utc=start_utc,
+            end_utc=end_utc,
+            idempotency_key=body.idempotency_key,
+            title=body.title,
+            organizer_id=body.organizer_id,
+            participant_ids=body.participant_ids,
+            room_id=body.room_id,
+            priority=body.priority,
+            series_key=body.series_key,
+        )
+
+
+class BookSlotRequest(BaseModel):
+    title: str
+    organizer_id: int
+    participant_ids: list[int] = []
+    room_id: int | None = None
+    priority: Literal["low", "medium", "high", "critical"] = "medium"
+    start_utc: str  # already UTC -- as returned by POST /api/meetings/suggest
+    end_utc: str
+    idempotency_key: str
+    series_key: str | None = None
+
+
+@app.post("/api/meetings/book-slot", status_code=201)
+def post_book_slot(body: BookSlotRequest) -> Meeting:
+    try:
+        start_utc = _parse_utc_z(body.start_utc)
+        end_utc = _parse_utc_z(body.end_utc)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    with db() as conn:
+        return _book_meeting_or_409(
+            conn,
+            start_utc=start_utc,
+            end_utc=end_utc,
+            idempotency_key=body.idempotency_key,
+            title=body.title,
+            organizer_id=body.organizer_id,
+            participant_ids=body.participant_ids,
+            room_id=body.room_id,
+            priority=body.priority,
+            series_key=body.series_key,
+        )
+
+
+class SuggestSlotsRequest(BaseModel):
+    required_ids: list[int] = Field(..., min_length=1)
+    optional_ids: list[int] = []
+    duration_minutes: int = Field(..., gt=0, le=480)
+    search_start_local: str  # "YYYY-MM-DDTHH:MM", wall-clock in `timezone`
+    search_end_local: str
+    timezone: str
+    granularity_minutes: int = Field(30, ge=5, le=120)
+    series_key: str | None = None
+    max_results: int = Field(10, ge=1, le=50)
+
+
+class SlotCostOut(BaseModel):
+    employee_id: int
+    employee_name: str
+    cost: float
+
+
+class RankedSlotOut(BaseModel):
+    start_utc: str
+    end_utc: str
+    total_cost: float
+    max_cost: float
+    required_costs: list[SlotCostOut]
+    optional_costs: list[SlotCostOut]
+
+
+@app.post("/api/meetings/suggest")
+def suggest_meeting_slots(body: SuggestSlotsRequest) -> list[RankedSlotOut]:
+    try:
+        search_start = local_wall_clock_to_utc(body.search_start_local, body.timezone)
+        search_end = local_wall_clock_to_utc(body.search_end_local, body.timezone)
+    except (ValueError, KeyError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if search_end <= search_start:
+        raise HTTPException(status_code=400, detail="search end must be after search start")
+    if search_end - search_start > MAX_SEARCH_WINDOW:
+        raise HTTPException(
+            status_code=400, detail=f"search window can't exceed {MAX_SEARCH_WINDOW.days} days"
+        )
+
+    all_ids = list(dict.fromkeys(body.required_ids + body.optional_ids))
+
+    with db() as conn:
+        employees = list_employees(conn)
+        timezone_by_id = {e.id: e.timezone for e in employees}
+        name_by_id = {e.id: e.name for e in employees}
+        unknown_ids = [eid for eid in all_ids if eid not in timezone_by_id]
+        if unknown_ids:
+            raise HTTPException(status_code=400, detail=f"unknown employee id(s): {unknown_ids}")
+
+        contexts = build_employee_contexts(
+            conn,
+            all_ids,
+            timezone_by_id,
+            to_utc_z(search_start),
+            to_utc_z(search_end),
+            body.series_key,
+        )
+
+    required_contexts = [contexts[eid] for eid in body.required_ids]
+    optional_contexts = [contexts[eid] for eid in body.optional_ids]
+
+    candidates = generate_candidate_slots(
+        search_start, search_end, body.duration_minutes, body.granularity_minutes
+    )
+    ranked = rank_slots(candidates, required_contexts, optional_contexts)
+
+    def to_cost_out(costs) -> list[SlotCostOut]:
+        return [
+            SlotCostOut(employee_id=c.employee_id, employee_name=name_by_id[c.employee_id], cost=round(c.cost, 1))
+            for c in costs
+        ]
+
+    return [
+        RankedSlotOut(
+            start_utc=to_utc_z(r.start_utc),
+            end_utc=to_utc_z(r.end_utc),
+            total_cost=round(r.total_cost, 1),
+            max_cost=round(r.max_cost, 1),
+            required_costs=to_cost_out(r.required_costs),
+            optional_costs=to_cost_out(r.optional_costs),
+        )
+        for r in ranked[: body.max_results]
+    ]
 
 
 @app.get("/api/meetings")

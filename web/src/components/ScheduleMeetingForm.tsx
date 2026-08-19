@@ -32,6 +32,7 @@ export default function ScheduleMeetingForm({
   const [localStart, setLocalStart] = useState("");
   const [localEnd, setLocalEnd] = useState("");
   const [timezone, setTimezone] = useState("");
+  const [seriesKey, setSeriesKey] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [created, setCreated] = useState<Meeting | null>(null);
@@ -104,6 +105,7 @@ export default function ScheduleMeetingForm({
         local_end: localEnd,
         timezone,
         idempotency_key: crypto.randomUUID(),
+        series_key: seriesKey.trim() || null,
       });
       setCreated(meeting);
       setTitle("");
@@ -242,6 +244,15 @@ export default function ScheduleMeetingForm({
             </select>
           </label>
         </div>
+
+        <label style={fieldStyle}>
+          Recurring series (optional)
+          <input
+            value={seriesKey}
+            onChange={(e) => setSeriesKey(e.target.value)}
+            placeholder="e.g. weekly-status-review -- ties usefulness feedback to future scheduling"
+          />
+        </label>
 
         <div>
           <button type="submit" disabled={submitting}>

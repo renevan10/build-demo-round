@@ -2,18 +2,20 @@ import { useEffect, useState } from "react";
 import { getEmployees, getOffices, type Employee, type Office } from "./api";
 import AllMeetingsPage from "./components/AllMeetingsPage";
 import EmployeeSchedulePage from "./components/EmployeeSchedulePage";
+import FindTimePage from "./components/FindTimePage";
 import ScheduleMeetingForm from "./components/ScheduleMeetingForm";
 
-type Tab = "schedule" | "all" | "employee";
+type Tab = "find" | "schedule" | "all" | "employee";
 
 const TABS: { id: Tab; label: string }[] = [
+  { id: "find", label: "Find a time" },
   { id: "schedule", label: "Schedule a meeting" },
   { id: "all", label: "All meetings" },
   { id: "employee", label: "Employee schedule" },
 ];
 
 export default function App() {
-  const [tab, setTab] = useState<Tab>("schedule");
+  const [tab, setTab] = useState<Tab>("find");
   const [employees, setEmployees] = useState<Employee[]>([]);
   const [offices, setOffices] = useState<Office[]>([]);
   const [directoryError, setDirectoryError] = useState<string | null>(null);
@@ -89,6 +91,13 @@ export default function App() {
               padding: "1.25rem 1.5rem",
             }}
           >
+            {tab === "find" && (
+              <FindTimePage
+                employees={employees}
+                offices={offices}
+                onBooked={() => setRefreshSignal((n) => n + 1)}
+              />
+            )}
             {tab === "schedule" && (
               <ScheduleMeetingForm
                 employees={employees}
