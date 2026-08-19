@@ -39,3 +39,72 @@ select {
 table {
   background: white;
 }
+
+/* Meeting-time dashboard bar chart: one series (total hours), so one
+   fixed accent hue -- no legend needed, per-bar hover/focus tooltip
+   carries the detail a direct label at the tip doesn't have room for. */
+.bar-row {
+  position: relative;
+  display: grid;
+  grid-template-columns: 130px 1fr;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.15rem 0.4rem;
+  border-radius: 4px;
+  outline: none;
+}
+
+.bar-row:hover,
+.bar-row:focus-visible {
+  background: #f3f4f6;
+}
+
+.bar-row-label {
+  font-size: 0.85rem;
+  text-align: right;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.bar-row-track {
+  display: flex;
+  align-items: center;
+  height: 20px;
+}
+
+.bar-row-fill {
+  height: 18px;
+  min-width: 2px;
+  background: var(--accent);
+  border-radius: 0 4px 4px 0;
+  flex-shrink: 0;
+}
+
+.bar-row-value {
+  margin-left: 0.4rem;
+  font-size: 0.8rem;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.bar-tooltip {
+  display: none;
+  position: absolute;
+  left: 130px;
+  top: 100%;
+  margin-top: 2px;
+  background: #111827;
+  color: #fff;
+  padding: 0.3rem 0.55rem;
+  border-radius: 4px;
+  font-size: 0.75rem;
+  white-space: nowrap;
+  z-index: 10;
+}
+
+.bar-row:hover .bar-tooltip,
+.bar-row:focus-visible .bar-tooltip {
+  display: block;
+}

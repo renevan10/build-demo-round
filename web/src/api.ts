@@ -82,6 +82,16 @@ export type RankedSlot = {
   optional_costs: SlotCost[];
 };
 
+export type EmployeeMeetingTime = {
+  employee_id: number;
+  employee_name: string;
+  meeting_count: number;
+  total_hours: number;
+  avg_hours_per_day: number;
+  avg_hours_per_week: number;
+  avg_hours_per_month: number;
+};
+
 export type BookSlotInput = {
   title: string;
   organizer_id: number;
@@ -167,6 +177,15 @@ async function postJson<T>(path: string, body: unknown): Promise<T> {
 
 export function createMeeting(input: CreateMeetingInput): Promise<Meeting> {
   return postJson<Meeting>("/api/meetings", input);
+}
+
+export function getMeetingTimeDashboard(
+  startDate: string,
+  endDate: string,
+): Promise<EmployeeMeetingTime[]> {
+  return getJson<EmployeeMeetingTime[]>(
+    `/api/dashboard/meeting-time?start_date=${startDate}&end_date=${endDate}`,
+  );
 }
 
 export function suggestMeetingSlots(input: SuggestSlotsInput): Promise<RankedSlot[]> {

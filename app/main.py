@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import sqlite3
 from contextlib import asynccontextmanager, contextmanager
-from datetime import datetime, timedelta, timezone as dt_timezone
+from datetime import date, datetime, timedelta, timezone as dt_timezone
 from typing import Iterator, Literal
 
 from fastapi import FastAPI, HTTPException, Query
@@ -31,11 +31,14 @@ from app.repository_meetings import (
     list_employee_schedule_with_details,
     list_meetings_with_details,
 )
+from app.dashboard import EmployeeMeetingTime, summarize_meeting_time
+from app.repository_dashboard import get_attendances_in_utc_window
 from app.repository_scheduling import build_employee_contexts
 from app.scheduling.slots import generate_candidate_slots, rank_slots
 from app.timeutil import local_wall_clock_to_utc, to_utc_z, utc_now
 
 MAX_SEARCH_WINDOW = timedelta(days=14)
+MAX_DASHBOARD_RANGE = timedelta(days=366)
 
 
 def _parse_utc_z(instant_z: str) -> datetime:
@@ -342,3 +345,43 @@ def get_employee_schedule(
 ) -> list[MeetingSummary]:
     with db() as conn:
         return list_employee_schedule_with_details(conn, employee_id, limit=limit, offset=offset)
+
+
+# ---- Dashboard ----
+
+
+@app.get("/api/dashboard/meeting-time")
+def get_meeting_time_dashboard(start_date: str, end_date: str) -> list[EmployeeMeetingTime]:
+    try:
+        range_start = date.fromisoformat(start_date)
+        range_end = date.fromisoformat(end_date)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if range_end < range_start:
+        raise HTTPException(status_code=400, detail="end_date must not be before start_date")
+    if range_end - range_start > MAX_DASHBOARD_RANGE:
+        raise HTTPException(
+            status_code=400, detail=f"range can't exceed {MAX_DASHBOARD_RANGE.days} days"
+        )
+
+    # Pad the UTC fetch window by a day on each side: a meeting near the
+    # edge of the requested range can land in-range for an employee whose
+    # local date differs from UTC's (the exact naive-UTC-date bug this
+    # project's guardrails exist to catch). app/dashboard.py re-filters
+    # precisely per employee using their own timezone.
+    window_start = datetime(range_start.year, range_start.month, range_start.day, tzinfo=dt_timezone.utc) - timedelta(
+        days=1
+    )
+    window_end = datetime(
+        range_end.year, range_end.month, range_end.day, tzinfo=dt_timezone.utc
+    ) + timedelta(days=2)
+
+    with db() as conn:
+        employees = list_employees(conn)
+        attendances = get_attendances_in_utc_window(conn, to_utc_z(window_start), to_utc_z(window_end))
+
+    timezone_by_id = {e.id: e.timezone for e in employees}
+    name_by_id = {e.id: e.name for e in employees}
+
+    return summarize_meeting_time(attendances, timezone_by_id, name_by_id, range_start, range_end)

@@ -1,17 +1,19 @@
 import { useEffect, useState } from "react";
 import { getEmployees, getOffices, type Employee, type Office } from "./api";
 import AllMeetingsPage from "./components/AllMeetingsPage";
+import DashboardPage from "./components/DashboardPage";
 import EmployeeSchedulePage from "./components/EmployeeSchedulePage";
 import FindTimePage from "./components/FindTimePage";
 import ScheduleMeetingForm from "./components/ScheduleMeetingForm";
 
-type Tab = "find" | "schedule" | "all" | "employee";
+type Tab = "find" | "schedule" | "all" | "employee" | "dashboard";
 
 const TABS: { id: Tab; label: string }[] = [
   { id: "find", label: "Find a time" },
   { id: "schedule", label: "Schedule a meeting" },
   { id: "all", label: "All meetings" },
   { id: "employee", label: "Employee schedule" },
+  { id: "dashboard", label: "Dashboard" },
 ];
 
 export default function App() {
@@ -109,6 +111,7 @@ export default function App() {
             {tab === "employee" && (
               <EmployeeSchedulePage employees={employees} refreshSignal={refreshSignal} />
             )}
+            {tab === "dashboard" && <DashboardPage refreshSignal={refreshSignal} />}
           </div>
         )}
       </main>
